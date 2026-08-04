@@ -1,0 +1,17 @@
+# data artefacts -- a single 4K run is several GB
+*.mp4
+*.npy
+*.npz
+frames_*/
+.det_*/
+detections_*
+coverage_*.jpg
+undist_*.jpg
+errmap_*.jpg
+*.log
+
+intrinsics_*.json
+
+venv/
+__pycache__/
+*.pyc
