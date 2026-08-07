@@ -75,11 +75,55 @@ views to select, default 500), `--nproc`, `--min-corners`.
 
 ### Filming the clip
 
-Move the board slowly through the whole frame, including the corners, and tilt it to a
-range of angles — a board that only ever appears fronto-parallel near the centre leaves
-both the focal length and the distortion terms poorly constrained. Keep the exposure short
-enough that the board isn't smeared; the pipeline scores sharpness and throws away the
-bottom 35%, but it can't recover detail that was never captured.
+Almost every bad calibration traces back to the capture, not the fit. The board is only
+a few hundred corners per frame, and the solver cannot invent constraints that were never
+filmed. Four things matter, roughly in order:
+
+**Keep the board in focus.** Check focus before you start recording, not after — on a
+fixed-focus lens that means confirming the board is beyond the hyperfocal distance, and on
+anything autofocusing it means locking focus so it can't hunt mid-clip. A soft board still
+detects, so nothing warns you; the corners just land a fraction of a pixel off, and that
+error goes straight into `D`. If the printed squares don't look crisp on playback, refilm.
+
+**Move slowly.** Motion blur is the single biggest killer of corner accuracy, and it is
+worst exactly where you need the data most — near the frame edges, where you tend to swing
+the board fastest. Glide, don't sweep; pause for a beat at each position. The pipeline
+scores every frame with a Laplacian-variance sharpness metric and discards the bottom 35%,
+but that only picks the best of what you gave it. It cannot recover detail that was never
+captured. Short exposure helps, so film bright.
+
+**Cover as much of the frame as you can.** Get the board into all four corners and along
+every edge, not just the comfortable centre region, and tilt it to a range of angles —
+30–45° in both axes, not just fronto-parallel. Distortion is only constrained where there
+is data, so an unvisited corner means the model is extrapolating there, and on a wide lens
+that is precisely where distortion is strongest. A board that only ever appears flat and
+central leaves focal length and the distortion terms fighting each other, and the fit can
+diverge without ever looking wrong. Aim for a clip a few minutes long.
+
+**Check the coverage image after every run.** `coverage_<tag>.jpg` is written before the
+fit, and reading it takes five seconds. Dark regions are places the model is guessing.
+The console report next to it gives edge/quadrant percentages and the distance from each
+frame corner to the nearest observation — if those corner distances are large, refilm
+rather than trusting the FOV number. Use `--detect-only` to get the coverage report without
+waiting for the calibration.
+
+### What a good result looks like
+
+Aim for **calibration RMS below 0.8 px** on both models. Both numbers are printed at the
+fit stage:
+
+```
+  pinhole  RMS 0.7106 px on 552 views (dropped 48)
+  fisheye  RMS 0.5669 px on 552 views
+```
+
+Above ~1 px, don't reach for solver settings — go back to the capture. It is nearly always
+blur or thin edge coverage, and both are cheaper to fix by refilming than to paper over.
+Note that the separate validation RMS, measured over *every* detected frame rather than the
+selected views, runs higher because it includes marginal frames the fit deliberately
+excluded; the two aren't comparable, so hold the 0.8 px target against the calibration
+number. Also check that pinhole and fisheye `fx` agree — the run warns if they don't — and
+that the coverage report shows data near all four corners.
 
 ## Pipeline stages
 
