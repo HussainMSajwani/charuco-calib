@@ -54,7 +54,7 @@ def make_detector(W):
 
 
 def worker(a):
-    wid, start, end, video, outdir, detdir, W, H = a
+    wid, start, end, video, outdir, detdir, W, H, frame_stride, save_frames = a
     cv2.setNumThreads(1)
     cd = make_detector(W)
     cap = cv2.VideoCapture(video)
@@ -64,6 +64,8 @@ def worker(a):
         ok, frame = cap.read()
         if not ok:
             break
+        if fi % frame_stride:
+            continue
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         cc, ci, mc, mi = cd.detectBoard(g)
         if ci is None or len(ci) < MIN_CORNERS_DET:
@@ -74,14 +76,15 @@ def worker(a):
         x1, y1 = np.clip(cc.max(0) + 5, 0, [W - 1, H - 1]).astype(int)
         roi = g[y0:y1 + 1, x0:x1 + 1]
         sharp = float(cv2.Laplacian(roi, cv2.CV_64F).var()) if roi.size > 100 else 0.0
-        cv2.imwrite(f"{outdir}/f{fi:06d}.jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if save_frames:
+            cv2.imwrite(f"{outdir}/f{fi:06d}.jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         recs.append((fi, cc, ci, sharp))
     cap.release()
     np.save(f"{detdir}/part_{wid:02d}.npy", np.array(recs, dtype=object), allow_pickle=True)
     return wid, len(recs)
 
 
-def stage_detect(video, tag, nproc):
+def stage_detect(video, tag, nproc, frame_stride=1, save_frames=True):
     outdir, detdir = f"frames_{tag}", f".det_{tag}"
     det_file = f"detections_{tag}.npy"
     cap = cv2.VideoCapture(video)
@@ -94,7 +97,8 @@ def stage_detect(video, tag, nproc):
         return np.load(det_file, allow_pickle=True), W, H
     os.makedirs(outdir, exist_ok=True); os.makedirs(detdir, exist_ok=True)
     b = np.linspace(0, n, nproc + 1).astype(int)
-    jobs = [(i, int(b[i]), int(b[i + 1]), video, outdir, detdir, W, H) for i in range(nproc)]
+    jobs = [(i, int(b[i]), int(b[i + 1]), video, outdir, detdir, W, H,
+             frame_stride, save_frames) for i in range(nproc)]
     t0 = time.time()
     with Pool(nproc) as p:
         for wid, c in p.imap_unordered(worker, jobs):
@@ -141,14 +145,88 @@ def coverage_report(recs, W, H, tag, save=True):
     return stats
 
 
-def select_views(recs, W, H, n_views, min_corners):
+def _view_geometry(rec, W, H, object_points):
+    """Calibration-free image/pose descriptor for diversity selection.
+
+    A planar homography and a nominal camera matrix are sufficient here: the
+    values are used only to keep visibly different scales, rolls and tilts,
+    not as inputs to the eventual camera calibration.
+    """
+    corners = np.asarray(rec[1], dtype=np.float64)
+    ids = np.asarray(rec[2], dtype=np.int32)
+    centroid = corners.mean(axis=0) / np.array([W, H], dtype=np.float64)
+    area = max(float(cv2.contourArea(cv2.convexHull(corners.astype(np.float32)))), 1.0)
+    log_area = np.log(area / (W * H))
+    homography, _ = cv2.findHomography(object_points[ids, :2], corners, 0)
+    if homography is None or not np.all(np.isfinite(homography)):
+        return np.array([centroid[0], centroid[1], log_area, 0., 1., 0., 0.])
+
+    nominal = np.array([[W, 0., (W - 1) / 2],
+                        [0., W, (H - 1) / 2],
+                        [0., 0., 1.]])
+    basis = np.linalg.inv(nominal) @ homography
+    r1 = basis[:, 0] / max(np.linalg.norm(basis[:, 0]), 1e-12)
+    r2 = basis[:, 1] / max(np.linalg.norm(basis[:, 1]), 1e-12)
+    normal = np.cross(r1, r2)
+    normal /= max(np.linalg.norm(normal), 1e-12)
+    if normal[2] < 0:
+        normal *= -1
+    roll = np.arctan2(homography[1, 0], homography[0, 0])
+    return np.array([centroid[0], centroid[1], log_area,
+                     np.sin(roll), np.cos(roll), normal[0], normal[1]])
+
+
+def _selection_diagnostics(recs, selected, W, H, cells, candidate_rows,
+                           features, label):
+    rows_by_index = {int(index): row for row, index in enumerate(candidate_rows)}
+    rows = [rows_by_index[int(index)] for index in selected]
+    occupied = np.zeros(32 * 18, dtype=bool)
+    for row in rows:
+        occupied[cells[row]] = True
+    chosen_features = features[rows]
+    frames = np.asarray([int(recs[index][0]) for index in selected])
+    roll = np.mod(np.arctan2(chosen_features[:, 3], chosen_features[:, 4]),
+                  2 * np.pi)
+    roll = np.sort(roll)
+    gaps = np.diff(np.r_[roll, roll[0] + 2 * np.pi])
+    circular_roll_span = 2 * np.pi - gaps.max() if len(roll) > 1 else 0.0
+    report = {
+        "label": label,
+        "count": int(len(selected)),
+        "spatial_cell_coverage_pct": float(100 * occupied.mean()),
+        "frame_range": [int(frames.min()), int(frames.max())],
+        "centroid_x_range": float(np.ptp(chosen_features[:, 0])),
+        "centroid_y_range": float(np.ptp(chosen_features[:, 1])),
+        "log_area_range": float(np.ptp(chosen_features[:, 2])),
+        "roll_coverage_deg": float(np.degrees(circular_roll_span)),
+        "normal_x_range": float(np.ptp(chosen_features[:, 5])),
+        "normal_y_range": float(np.ptp(chosen_features[:, 6])),
+    }
+    print(f"  {label}: {report['count']} views, cells "
+          f"{report['spatial_cell_coverage_pct']:.1f}%, "
+          f"centroid span {report['centroid_x_range']:.2f}x"
+          f"{report['centroid_y_range']:.2f}, "
+          f"scale log-span {report['log_area_range']:.2f}, "
+          f"roll span {report['roll_coverage_deg']:.0f} deg, "
+          f"tilt-normal span {report['normal_x_range']:.2f}x"
+          f"{report['normal_y_range']:.2f}")
+    return report
+
+
+def select_views(recs, W, H, n_views, min_corners, min_frame_gap=12,
+                 excluded=(), label="selected"):
     ncor = np.array([len(r[2]) for r in recs])
     sharp = np.array([r[3] for r in recs])
     fidx = np.array([r[0] for r in recs])
     thr = np.percentile(sharp, 35)
     cand = np.flatnonzero((ncor >= min_corners) & (sharp >= thr))
-    if len(cand) < 30:                       # relax if the clip is short
+    relaxed_quality_gate = len(cand) < 30
+    if relaxed_quality_gate:                 # relax if the clip is short
         cand = np.flatnonzero(ncor >= max(12, min_corners // 2))
+    excluded = set(int(index) for index in excluded)
+    cand = np.asarray([index for index in cand if int(index) not in excluded])
+    if not len(cand):
+        raise RuntimeError("no calibration candidates remain after filtering")
     GX, GY = 32, 18
     cells = []
     for i in cand:
@@ -159,23 +237,49 @@ def select_views(recs, W, H, n_views, min_corners):
     M = np.zeros((len(cand), GX * GY), np.float32)
     for k, cl in enumerate(cells):
         M[k, cl] = 1.0
+    object_points = make_board().getChessboardCorners().astype(np.float64)
+    features = np.asarray([_view_geometry(recs[index], W, H, object_points)
+                           for index in cand])
+    centre = np.median(features, axis=0)
+    scale = np.percentile(features, 90, axis=0) - np.percentile(features, 10, axis=0)
+    scale[scale < 1e-6] = 1.0
+    normalized = (features - centre) / scale
+    # Centroid, log-area, circular roll and board-normal tilt all participate.
+    normalized *= np.array([0.8, 0.8, 1.2, 0.5, 0.5, 1.0, 1.0])
+    quality = 0.5 * np.clip(ncor[cand] / max(ncor[cand].max(), 1), 0, 1)
+    sharp_range = np.percentile(sharp[cand], 90) - thr
+    if sharp_range > 0:
+        quality += 0.5 * np.clip((sharp[cand] - thr) / sharp_range, 0, 1)
     w = np.ones(GX * GY, np.float32)
     avail = np.ones(len(cand), bool)
+    nearest_pose_distance = np.full(len(cand), np.inf)
     chosen = []
     for _ in range(n_views):
-        sc = M @ w; sc[~avail] = -1
+        spatial = np.array([w[cl].mean() for cl in cells])
+        spatial *= np.sqrt(np.maximum(ncor[cand], 1) / max(ncor[cand].max(), 1))
+        if chosen:
+            pose_novelty = 1.0 - np.exp(-nearest_pose_distance)
+        else:
+            pose_novelty = np.ones(len(cand))
+        sc = 0.55 * spatial + 0.35 * pose_novelty + 0.10 * quality
+        sc[~avail] = -1
         k = int(np.argmax(sc))
         if sc[k] <= 0:
             break
         chosen.append(cand[k])
-        avail &= np.abs(fidx[cand] - fidx[cand[k]]) >= 3
+        distance_to_new = np.linalg.norm(normalized - normalized[k], axis=1)
+        nearest_pose_distance = np.minimum(nearest_pose_distance, distance_to_new)
+        avail &= np.abs(fidx[cand] - fidx[cand[k]]) >= min_frame_gap
         avail[k] = False
         w[cells[k]] *= 0.55
-    rows = [np.flatnonzero(cand == c)[0] for c in chosen]
-    cov = (M[rows].sum(0) > 0).mean()
-    print(f"  selected {len(chosen)} views, cell coverage {cov*100:.1f}% "
-          f"(candidates {len(cand)}, sharp_thr {thr:.0f})")
-    return np.array(chosen)
+    selected = np.asarray(chosen, dtype=np.int32)
+    report = _selection_diagnostics(recs, selected, W, H, cells, cand,
+                                    features, label)
+    report.update({"candidate_count": int(len(cand)),
+                   "sharpness_threshold": float(thr),
+                   "relaxed_quality_gate": relaxed_quality_gate,
+                   "min_frame_gap": int(min_frame_gap)})
+    return selected, report
 
 
 def validate(recs, K, D, OBJP, fisheye):
@@ -213,8 +317,16 @@ def main():
     ap.add_argument("--nproc", type=int, default=14)
     ap.add_argument("--views", type=int, default=500)
     ap.add_argument("--min-corners", type=int, default=30)
+    ap.add_argument("--min-frame-gap", type=int, default=12,
+                    help="minimum source-frame separation between selected views")
+    ap.add_argument("--max-iterations", type=int, default=300,
+                    help="maximum iterations for each calibration optimization")
     ap.add_argument("--detect-only", action="store_true",
                     help="detect + coverage report only, skip calibration")
+    ap.add_argument("--frame-stride", type=int, default=1,
+                    help="analyze every Nth frame (all frames are still decoded)")
+    ap.add_argument("--no-save-frames", action="store_true",
+                    help="do not export every detected video frame as JPEG")
     ap.add_argument("--square", type=float, default=0.008, help="checker size in metres")
     ap.add_argument("--marker", type=float, default=0.006, help="aruco marker size in metres")
     a = ap.parse_args()
@@ -224,21 +336,33 @@ def main():
     print(f"board: {SQX}x{SQY} squares, checker {SQUARE_LEN*1000:.1f} mm, "
           f"marker {MARKER_LEN*1000:.1f} mm (ratio {MARKER_LEN/SQUARE_LEN:.4f}), DICT_4X4_50, legacy")
 
-    recs, W, H = stage_detect(a.video, a.tag, a.nproc)
+    if a.frame_stride < 1:
+        ap.error("--frame-stride must be at least 1")
+    if a.max_iterations < 1:
+        ap.error("--max-iterations must be at least 1")
+    if a.views < 1:
+        ap.error("--views must be at least 1")
+    if a.min_frame_gap < 1:
+        ap.error("--min-frame-gap must be at least 1")
+    recs, W, H = stage_detect(a.video, a.tag, a.nproc, a.frame_stride,
+                              not a.no_save_frames)
     print(f"\n=== coverage {a.tag} ({W}x{H}) ===")
     coverage_report(recs, W, H, a.tag)
     if a.detect_only:
         return
     OBJP = make_board().getChessboardCorners().astype(np.float64)
     print(f"\n=== calibrating {a.tag} ({W}x{H}) ===")
-    sel = select_views(recs, W, H, a.views, a.min_corners)
+    sel, selection_initial = select_views(
+        recs, W, H, a.views, a.min_corners, a.min_frame_gap,
+        label="initial diversity selection")
 
     def build(idxs, f64=False):
         op = [OBJP[recs[i][2]].reshape(-1, 1, 3).astype(np.float64 if f64 else np.float32) for i in idxs]
         ip = [recs[i][1].reshape(-1, 1, 2).astype(np.float64 if f64 else np.float32) for i in idxs]
         return op, ip
 
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 300, 1e-9)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT,
+            a.max_iterations, 1e-9)
 
     def pinhole_staged(op, ip, K_init=None):
         """Release parameters gradually. Fitting all 5 distortion terms plus a free
@@ -270,10 +394,15 @@ def main():
             ipf = [recs[i][1].reshape(1, -1, 2).astype(np.float64) for i in use]
             Kf = (K_init.copy() if K_init is not None else COLD.copy())
             try:
+                # OpenCV 4.x exposes these in cv2.fisheye, while OpenCV 5.x
+                # exposes them at the top level. Accept both layouts.
+                fe_flags = 0
+                for name in ("CALIB_RECOMPUTE_EXTRINSIC", "CALIB_FIX_SKEW",
+                             "CALIB_USE_INTRINSIC_GUESS"):
+                    fe_flags |= getattr(cv2.fisheye, name, getattr(cv2, name, 0))
                 r = cv2.fisheye.calibrate(
                     opf, ipf, (W, H), Kf, np.zeros((4, 1)),
-                    flags=cv2.CALIB_RECOMPUTE_EXTRINSIC | cv2.CALIB_FIX_SKEW
-                    | cv2.CALIB_USE_INTRINSIC_GUESS, criteria=crit)
+                    flags=fe_flags, criteria=crit)
                 if mc != min_corners:
                     print(f"    (fisheye needed min_corners>={mc}: {len(use)} views)")
                 return r
@@ -294,7 +423,14 @@ def main():
     _, Kp, Dp, _, _, _, _, pve = cv2.calibrateCameraExtended(
         op, ip, (W, H), Kp, Dp, flags=cv2.CALIB_USE_INTRINSIC_GUESS, criteria=crit)
     pve = np.asarray(pve).ravel()
-    keep = sel[pve <= np.percentile(pve, 92)]
+    rejected = sel[pve > np.percentile(pve, 92)]
+    retained_count = len(sel) - len(rejected)
+    # Re-run diversity selection with the high-error frames banned. This keeps
+    # the final view count fixed while replacing spatial/pose gaps that simple
+    # deletion could leave behind.
+    keep, selection_final = select_views(
+        recs, W, H, retained_count, a.min_corners, a.min_frame_gap,
+        excluded=rejected, label="final selection after outlier replacement")
     op, ip = build(keep)
     Kp, Dp = pinhole_staged(op, ip, K_init=Kp)
     rms_p, Kp, Dp, _, _, sdi, _, pve2 = cv2.calibrateCameraExtended(
@@ -376,6 +512,13 @@ def main():
     out = {
         "video": a.video, "image_size": [W, H], "n_frames_with_board": len(recs),
         "n_calib_views": int(len(keep)),
+        "view_selection": {
+            "method": "spatial coverage plus scale/roll/tilt/centroid max-min diversity",
+            "initial": selection_initial,
+            "reprojection_outliers_banned": int(len(rejected)),
+            "final": selection_final,
+            "selected_frame_indices": [int(recs[index][0]) for index in keep],
+        },
         "pinhole": {"fx": Kp[0, 0], "fy": Kp[1, 1], "cx": Kp[0, 2], "cy": Kp[1, 2],
                     "dist": [float(v) for v in Dp], "rms_calib_px": float(rms_p),
                     "validation": vp, "poly_invertible_to_rd": rd_max,

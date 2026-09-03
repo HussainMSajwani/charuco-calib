@@ -70,8 +70,10 @@ A pass writes:
 | `calib_pinhole_<tag>.npz`, `calib_fisheye_<tag>.npz` | `K`, `D`, `size` |
 | `intrinsics_<tag>.json` | both models, FOV, validation stats, model-validity flags |
 
-Useful flags: `--detect-only` (detection + coverage report, no fit), `--views` (how many
-views to select, default 500), `--nproc`, `--min-corners`.
+Useful flags: `--detect-only` (detection + coverage report, no fit), `--views` (maximum
+number of views to select, default 500), `--nproc`, `--min-corners`,
+`--min-frame-gap` (minimum separation in original source-frame numbers, default 12),
+`--frame-stride`, `--no-save-frames`, and `--max-iterations`.
 
 ### Filming the clip
 
@@ -133,9 +135,10 @@ that the coverage report shows data near all four corners.
 2. **Coverage report** — heatmap plus edge/quadrant/corner statistics. Distortion is only
    constrained where there is data, so this gates whether the FOV number is trustworthy at
    all. Read it before believing anything downstream.
-3. **View selection** — greedy max-coverage over a 32×18 image grid, restricted to frames
-   above the 35th sharpness percentile, with a ±3-frame spacing rule so near-duplicate
-   frames can't stack.
+3. **View selection** — deterministic greedy selection balancing a 32×18 corner-coverage
+   grid with board centroid, apparent scale, roll, and board-normal tilt. Candidates are
+   restricted to the requested corner count and the top 65% by sharpness, with a
+   configurable source-frame spacing rule.
 4. **Fit** — fisheye *first*, because it stays well conditioned at wide FOV even with
    coverage holes, then use its `K` to seed the pinhole fit. The pinhole fit releases
    parameters in stages (fixed principal point + `k1` only → tangential → `k3`) and runs
@@ -144,6 +147,100 @@ that the coverage report shows data near all four corners.
    reporting RMS / mean / median / p95.
 6. **FOV** — inverts the fisheye θ(r) numerically and measures the angle between edge rays.
    Also prints the centred convention and the naive pinhole number for comparison.
+
+## Frame-selection procedure
+
+The solver needs diversity in both *where* the board appears and *how* it is posed. Merely
+moving a large fronto-parallel board around the image can cover the frame while leaving
+focal length and distortion poorly separated. `select_views()` therefore uses the
+following deterministic procedure.
+
+### 1. Candidate quality gate
+
+A detected frame is initially eligible when it has at least `--min-corners` interpolated
+ChArUco corners and its board-ROI Laplacian variance is at or above the 35th percentile of
+all detections. If fewer than 30 candidates survive, short-clip fallback relaxes the
+corner requirement to `max(12, min_corners/2)` and removes the sharpness gate. This
+fallback is recorded as `relaxed_quality_gate: true` and should not be mistaken for a
+normal production-quality selection.
+
+### 2. Calibration-free pose descriptors
+
+For every candidate, a planar homography maps known ChArUco board coordinates to detected
+image corners. It supplies a selection-only descriptor containing:
+
+- normalized board centroid `(x/W, y/H)`;
+- log convex-hull area, representing apparent board scale;
+- roll as circular `sin(roll), cos(roll)` coordinates;
+- the board normal's x/y components, estimated with a nominal camera matrix, representing
+  perspective tilt in both axes.
+
+These values are not passed to OpenCV's calibration and do not assume the final camera
+intrinsics. They only distinguish visibly different views. Each descriptor dimension is
+robustly normalized by its candidate-set 10th-to-90th-percentile span.
+
+### 3. Combined spatial and pose-diversity score
+
+Detected corners are also mapped into a 32×18 image grid. At each greedy step, every
+available candidate receives:
+
+```text
+0.55 × spatial novelty
++ 0.35 × distance from the nearest already-selected pose descriptor
++ 0.10 × corner-count/sharpness quality
+```
+
+Spatial novelty is the mean current weight of the cells touched by that frame, with a
+small square-root corner-count factor. After selection, weights of all touched cells are
+multiplied by 0.55, so observations in unseen regions are favored without permanently
+forbidding useful repeats. Pose novelty uses max-min selection: it favors the candidate
+furthest from its nearest selected pose in centroid/scale/roll/tilt space.
+
+Frames closer than `--min-frame-gap` source-frame numbers to a chosen frame are made
+unavailable. The default is 12 source frames (0.2 seconds at 60 fps), regardless of
+`--frame-stride`. `--views` is a maximum: the selector stops below it if the quality and
+temporal constraints leave fewer independent candidates.
+
+### 4. Reprojection-outlier replacement
+
+The first staged pinhole solve measures per-view reprojection error. Frames above its 92nd
+percentile are banned. Instead of simply deleting those frames—which could remove the only
+edge or tilted observations—the diversity selector runs again over the full candidate
+pool, requests the retained 92% count, and may replace them with other sharp, geometrically
+different frames. Both final pinhole and fisheye models use this reselected set.
+
+### 5. Auditable output
+
+The console prints initial and final selected-set diagnostics: cell coverage; centroid,
+scale, roll and tilt-normal spans; candidate count; sharpness threshold; and frame gap.
+`intrinsics_<tag>.json` stores those values under `view_selection`, together with the final
+source-frame indices and number of banned reprojection outliers.
+
+This is still a selector, not a proof that the capture is sufficient. Descriptor spans are
+relative to the available candidates, and the homography-derived tilt is approximate.
+Always inspect the full-detection coverage report, compare subset fits, and refilm when an
+edge, corner, scale, or strong tilt was never recorded.
+
+### Selector tests
+
+Synthetic tests exercise pose spread, hard source-frame spacing, and outlier exclusion:
+
+```bash
+venv/bin/python -m unittest -v test_view_selection.py
+```
+
+The selector was also regression-tested on two 1920×1080 IMX415 detection caches using
+the 33/24 mm board. The stricter 12-frame separation intentionally retained fewer views:
+
+| Dataset | Old/new final views | Old/new fisheye calibration RMS | Old/new all-detection RMS | FOV change | Principal-point change |
+|---|---:|---:|---:|---:|---:|
+| wide, 200 requested | 184 / 164 | 0.992 / 1.043 px | 1.139 / 1.155 px | +0.516° H, +0.259° V | -3.24 px x, -0.00 px y |
+| narrow combined, 300 requested | 276 / 134 | 0.889 / 0.968 px | 1.369 / 1.365 px | +0.302° H, +0.183° V | -6.41 px x, +4.53 px y |
+
+Removing correlated near-neighbor frames raises calibration-set RMS, as expected, while
+all-detection error remains within 0.02 px. The parameter movement is comparable to the
+existing subset sensitivity and is precisely why the selected-frame diagnostics and
+cross-subset comparisons must accompany any reported calibration.
 
 ### Guards worth knowing about
 
